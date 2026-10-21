@@ -1231,6 +1231,73 @@ func TestGoBuildWithKOCACHE(t *testing.T) {
 	})
 }
 
+func TestGoBuildWithWarmKOCACHE(t *testing.T) {
+	t.Setenv("KOCACHE", t.TempDir())
+
+	// A multi-platform base, so that platforms are built concurrently.
+	platforms := []v1.Platform{
+		{OS: "linux", Architecture: "amd64"},
+		{OS: "linux", Architecture: "arm64"},
+		{OS: "linux", Architecture: "arm", Variant: "v7"},
+	}
+	adds := make([]mutate.IndexAddendum, 0, len(platforms))
+	for _, p := range platforms {
+		img, err := random.Image(1024, 1)
+		if err != nil {
+			t.Fatalf("random.Image() = %v", err)
+		}
+		cf, err := img.ConfigFile()
+		if err != nil {
+			t.Fatalf("ConfigFile() = %v", err)
+		}
+		cf = cf.DeepCopy()
+		cf.OS, cf.Architecture, cf.Variant = p.OS, p.Architecture, p.Variant
+		img, err = mutate.ConfigFile(img, cf)
+		if err != nil {
+			t.Fatalf("mutate.ConfigFile() = %v", err)
+		}
+		adds = append(adds, mutate.IndexAddendum{
+			Add:        img,
+			Descriptor: v1.Descriptor{Platform: &p},
+		})
+	}
+	base := mutate.AppendManifests(empty.Index, adds...)
+
+	build := func() v1.Hash {
+		t.Helper()
+		ng, err := NewGo(
+			context.Background(),
+			"",
+			WithBaseImages(func(context.Context, string) (name.Reference, Result, error) { return baseRef, base, nil }),
+			WithPlatforms("all"),
+			withSBOMber(fauxSBOM),
+		)
+		if err != nil {
+			t.Fatalf("NewGo() = %v", err)
+		}
+		result, err := ng.Build(context.Background(), StrictScheme+"github.com/google/ko/test")
+		if err != nil {
+			t.Fatalf("Build() = %v", err)
+		}
+		idx, ok := result.(v1.ImageIndex)
+		if !ok {
+			t.Fatalf("Build() = %T, wanted an index", result)
+		}
+		d, err := idx.Digest()
+		if err != nil {
+			t.Fatalf("Digest() = %v", err)
+		}
+		return d
+	}
+
+	// The second build uses the layer metadata cached by the first, and must
+	// produce the same image.
+	cold, warm := build(), build()
+	if cold != warm {
+		t.Errorf("warm KOCACHE build digest = %v, wanted %v", warm, cold)
+	}
+}
+
 func TestGoBuildWithoutSBOM(t *testing.T) {
 	baseLayers := int64(3)
 	base, err := random.Image(1024, baseLayers)

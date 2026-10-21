@@ -173,11 +173,8 @@ func (gbo *gobuildOpener) Open() (Interface, error) {
 		dir:                  gbo.dir,
 		debug:                gbo.debug,
 		platformMatcher:      matcher,
-		cache: &layerCache{
-			buildToDiff: map[string]buildIDToDiffID{},
-			diffToDesc:  map[string]diffIDToDescriptor{},
-		},
-		semaphore: semaphore.NewWeighted(int64(gbo.jobs)),
+		cache:                &layerCache{},
+		semaphore:            semaphore.NewWeighted(int64(gbo.jobs)),
 	}, nil
 }
 
@@ -1229,17 +1226,18 @@ func (g *gobuild) buildOne(ctx context.Context, refStr string, base v1.Image, pl
 		return nil, fmt.Errorf("linux_capabilities: %w", err)
 	}
 
-	miss := func() (v1.Layer, error) {
-		return buildLayer(appPath, file, platform, layerMediaType, &lo)
+	key := binaryLayerKey{ImportPath: ref.Path(), AppPath: appPath, Platform: platform, MediaType: layerMediaType}
+	build := func(file string) (v1.Layer, error) {
+		return buildLayer(key.AppPath, file, key.Platform, key.MediaType, &lo)
 	}
 
 	var binaryLayer v1.Layer
 	switch {
 	case lo.linuxCapabilities != nil:
 		log.Printf("Some options prevent us from using layer cache")
-		binaryLayer, err = miss()
+		binaryLayer, err = build(file)
 	default:
-		binaryLayer, err = g.cache.get(ctx, file, miss)
+		binaryLayer, err = g.cache.get(ctx, file, key, build)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("cache.get(%q): %w", file, err)
@@ -1267,12 +1265,12 @@ func (g *gobuild) buildOne(ctx context.Context, refStr string, base v1.Image, pl
 
 		delvePath = path.Join("/ko-app", filepath.Base(delveBinary))
 
-		// add layer with delve binary
-		delveLayer, err := g.cache.get(ctx, delveBinary, func() (v1.Layer, error) {
-			return buildLayer(delvePath, delveBinary, platform, layerMediaType, &lo)
-		})
+		// add layer with delve binary. This doesn't use the layer cache: a
+		// cache hit reads the binary lazily, but delveDir is removed when we
+		// return.
+		delveLayer, err := buildLayer(delvePath, delveBinary, platform, layerMediaType, &lo)
 		if err != nil {
-			return nil, fmt.Errorf("cache.get(%q): %w", delveBinary, err)
+			return nil, fmt.Errorf("building Delve layer: %w", err)
 		}
 
 		layers = append(layers, mutate.Addendum{
@@ -1377,6 +1375,17 @@ func (g *gobuild) buildOne(ctx context.Context, refStr string, base v1.Image, pl
 // layerOptions captures additional options to apply when authoring layer
 type layerOptions struct {
 	linuxCapabilities *caps.FileCaps
+}
+
+// binaryLayerKey is the layer cache key for a binary layer: the arguments to
+// buildLayer other than the binary and the layerOptions, which bypass the
+// cache when set, and the import path, so that apps with the same file name
+// don't evict each other's entries.
+type binaryLayerKey struct {
+	ImportPath string
+	AppPath    string
+	Platform   *v1.Platform
+	MediaType  types.MediaType
 }
 
 func buildLayer(appPath, file string, platform *v1.Platform, layerMediaType types.MediaType, opts *layerOptions) (v1.Layer, error) {

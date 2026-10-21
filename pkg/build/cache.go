@@ -17,186 +17,181 @@ package build
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
-	"sync"
+	"time"
 
 	"github.com/google/go-containerregistry/pkg/logs"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/partial"
 )
 
-type diffIDToDescriptor map[v1.Hash]v1.Descriptor
-type buildIDToDiffID map[string]v1.Hash
+// layerCache caches the metadata (diffid and descriptor) of layers built from
+// Go binaries in $KOCACHE, so that a rebuilt but unchanged binary doesn't need
+// to be tarred and compressed again unless the registry is missing the layer.
+//
+// Entries live at $KOCACHE/layers/<key>/<buildid>.json, where key hashes the
+// inputs to the layer other than the binary, and buildid hashes the binary's
+// build ID. An entry's contents are determined by its path, so concurrent
+// writers (goroutines or ko processes sharing $KOCACHE) write identical bytes
+// and need no locking, and an entry that can't be read is just a cache miss.
+// Only the maxEntriesPerKey most recently used entries are kept per key.
+type layerCache struct{}
 
-type layerCache struct {
-	buildToDiff map[string]buildIDToDiffID
-	diffToDesc  map[string]diffIDToDescriptor
-	sync.Mutex
+const maxEntriesPerKey = 4
+
+// layerBuilder builds a layer from the binary at file.
+type layerBuilder func(file string) (v1.Layer, error)
+
+// cacheEntry is the on-disk form of a cached layer's metadata.
+type cacheEntry struct {
+	DiffID     v1.Hash       `json:"diffid"`
+	Descriptor v1.Descriptor `json:"descriptor"`
 }
 
-type layerFactory func() (v1.Layer, error)
-
-func (c *layerCache) get(ctx context.Context, file string, miss layerFactory) (v1.Layer, error) {
-	if os.Getenv("KOCACHE") == "" {
-		return miss()
+// get returns the layer that build builds from the binary at file, using
+// cached metadata to defer building it when possible. inputs must hold
+// everything other than the binary that affects the layer build builds; it is
+// encoded with encoding/json to form the cache key.
+//
+// On a cache hit, build is called lazily, only if the layer's contents are
+// needed, so file must still exist when the returned layer is used.
+func (c *layerCache) get(ctx context.Context, file string, inputs any, build layerBuilder) (v1.Layer, error) {
+	kc := os.Getenv("KOCACHE")
+	if kc == "" {
+		return build(file)
 	}
+	buildid, err := getBuildID(ctx, file)
+	if err != nil || buildid == "" {
+		logs.Debug.Printf("no buildid for %q (%v), not caching", file, err)
+		return build(file)
+	}
+	dir, err := cacheKeyDir(kc, inputs, build)
+	if err != nil {
+		logs.Debug.Printf("no cache key for %q (%v), not caching", file, err)
+		return build(file)
+	}
+	path := cacheEntryPath(dir, buildid)
 
 	// Cache hit.
-	if diffid, desc, err := c.getMeta(ctx, file); err != nil {
-		logs.Debug.Printf("getMeta(%q): %v", file, err)
-	} else {
+	var entry cacheEntry
+	/* #nosec G304 -- path is derived from the user-controlled KOCACHE. */
+	if b, err := os.ReadFile(path); err == nil && json.Unmarshal(b, &entry) == nil {
+		// Mark the entry as recently used, for prune.
+		now := time.Now()
+		_ = os.Chtimes(path, now, now)
 		return &lazyLayer{
-			diffid:     *diffid,
-			desc:       *desc,
-			buildLayer: miss,
+			diffid:     entry.DiffID,
+			desc:       entry.Descriptor,
+			buildLayer: func() (v1.Layer, error) { return build(file) },
 		}, nil
 	}
 
 	// Cache miss.
-	layer, err := miss()
+	layer, err := build(file)
 	if err != nil {
-		return nil, fmt.Errorf("miss(%q): %w", file, err)
+		return nil, fmt.Errorf("build(%q): %w", file, err)
 	}
-	if err := c.put(ctx, file, layer); err != nil {
+	if err := writeCacheEntry(path, layer); err != nil {
 		log.Printf("failed to cache metadata %s: %v", file, err)
 	}
+	prune(dir)
 	return layer, nil
 }
 
-func (c *layerCache) getMeta(ctx context.Context, file string) (*v1.Hash, *v1.Descriptor, error) {
-	buildid, err := getBuildID(ctx, file)
+// cacheKeyDir returns the directory for the entries of layers that build
+// builds with inputs. Its name hashes inputs and the digest of the layer that
+// build builds from a fixed probe file, so that entries aren't used once
+// build builds different layers for the same inputs, e.g. in a new ko version.
+func cacheKeyDir(kocache string, inputs any, build layerBuilder) (string, error) {
+	tmp, err := os.MkdirTemp("", "ko-layer-probe")
 	if err != nil {
-		return nil, nil, err
+		return "", err
 	}
-
-	if buildid == "" {
-		return nil, nil, fmt.Errorf("no buildid for %q", file)
+	defer os.RemoveAll(tmp)
+	probe := filepath.Join(tmp, "probe")
+	if err := os.WriteFile(probe, []byte("ko layer cache probe\n"), 0o600); err != nil {
+		return "", err
 	}
-
-	// TODO: Implement better per-file locking.
-	c.Lock()
-	defer c.Unlock()
-
-	btod, err := c.readBuildToDiff(file)
+	layer, err := build(probe)
 	if err != nil {
-		return nil, nil, err
+		return "", fmt.Errorf("building probe layer: %w", err)
 	}
-	dtod, err := c.readDiffToDesc(file)
+	digest, err := layer.Digest()
 	if err != nil {
-		return nil, nil, err
+		return "", fmt.Errorf("building probe layer: %w", err)
 	}
 
-	diffid, ok := btod[buildid]
-	if !ok {
-		return nil, nil, fmt.Errorf("no diffid for %q", buildid)
+	b, err := json.Marshal(struct {
+		Inputs any
+		Probe  v1.Hash
+	}{inputs, digest})
+	if err != nil {
+		return "", fmt.Errorf("encoding layer cache key: %w", err)
 	}
-
-	desc, ok := dtod[diffid]
-	if !ok {
-		return nil, nil, fmt.Errorf("no desc for %q", diffid)
-	}
-
-	return &diffid, &desc, nil
+	return filepath.Join(kocache, "layers", hashString(b)), nil
 }
 
-// Compute new layer metadata and cache it in-mem and on-disk.
-func (c *layerCache) put(ctx context.Context, file string, layer v1.Layer) error {
-	buildid, err := getBuildID(ctx, file)
-	if err != nil {
-		return err
-	}
+// cacheEntryPath returns the path of the entry in dir for a binary with
+// buildid, which may contain slashes.
+func cacheEntryPath(dir, buildid string) string {
+	return filepath.Join(dir, hashString([]byte(buildid))+".json")
+}
 
+func hashString(b []byte) string {
+	h := sha256.Sum256(b)
+	return hex.EncodeToString(h[:])
+}
+
+func writeCacheEntry(path string, layer v1.Layer) error {
 	desc, err := partial.Descriptor(layer)
 	if err != nil {
 		return err
 	}
-
 	diffid, err := layer.DiffID()
 	if err != nil {
 		return err
 	}
-
-	btod, ok := c.buildToDiff[file]
-	if !ok {
-		btod = buildIDToDiffID{}
-	}
-	btod[buildid] = diffid
-
-	dtod, ok := c.diffToDesc[file]
-	if !ok {
-		dtod = diffIDToDescriptor{}
-	}
-	dtod[diffid] = *desc
-
-	// TODO: Implement better per-file locking.
-	c.Lock()
-	defer c.Unlock()
-
-	btodf, err := os.OpenFile(filepath.Join(filepath.Dir(file), "buildid-to-diffid"), os.O_RDWR|os.O_CREATE, 0755)
+	b, err := json.Marshal(cacheEntry{DiffID: diffid, Descriptor: *desc})
 	if err != nil {
-		return fmt.Errorf("opening buildid-to-diffid: %w", err)
-	}
-	defer btodf.Close()
-
-	dtodf, err := os.OpenFile(filepath.Join(filepath.Dir(file), "diffid-to-descriptor"), os.O_RDWR|os.O_CREATE, 0755)
-	if err != nil {
-		return fmt.Errorf("opening diffid-to-descriptor: %w", err)
-	}
-	defer dtodf.Close()
-
-	enc := json.NewEncoder(btodf)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(&btod); err != nil {
 		return err
 	}
-
-	enc = json.NewEncoder(dtodf)
-	enc.SetIndent("", "  ")
-	return enc.Encode(&dtod)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(path, b, 0o600)
 }
 
-func (c *layerCache) readDiffToDesc(file string) (diffIDToDescriptor, error) {
-	if dtod, ok := c.diffToDesc[file]; ok {
-		return dtod, nil
+// prune removes all but the maxEntriesPerKey most recently used entries in
+// dir. Concurrent prunes may race, but at worst remove an entry that would
+// have been a cache hit.
+func prune(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil || len(entries) <= maxEntriesPerKey {
+		return
 	}
-
-	dtodf, err := os.Open(filepath.Join(filepath.Dir(file), "diffid-to-descriptor"))
-	if err != nil {
-		return nil, fmt.Errorf("opening diffid-to-descriptor: %w", err)
+	type file struct {
+		path  string
+		mtime time.Time
 	}
-	defer dtodf.Close()
-
-	var dtod diffIDToDescriptor
-	if err := json.NewDecoder(dtodf).Decode(&dtod); err != nil {
-		return nil, err
+	files := make([]file, 0, len(entries))
+	for _, e := range entries {
+		if info, err := e.Info(); err == nil {
+			files = append(files, file{filepath.Join(dir, e.Name()), info.ModTime()})
+		}
 	}
-	c.diffToDesc[file] = dtod
-	return dtod, nil
-}
-
-func (c *layerCache) readBuildToDiff(file string) (buildIDToDiffID, error) {
-	if btod, ok := c.buildToDiff[file]; ok {
-		return btod, nil
+	slices.SortFunc(files, func(a, b file) int { return b.mtime.Compare(a.mtime) })
+	for _, f := range files[min(maxEntriesPerKey, len(files)):] {
+		_ = os.Remove(f.path)
 	}
-
-	btodf, err := os.Open(filepath.Join(filepath.Dir(file), "buildid-to-diffid"))
-	if err != nil {
-		return nil, fmt.Errorf("opening buildid-to-diffid: %w", err)
-	}
-	defer btodf.Close()
-
-	var btod buildIDToDiffID
-	if err := json.NewDecoder(btodf).Decode(&btod); err != nil {
-		return nil, err
-	}
-	c.buildToDiff[file] = btod
-	return btod, nil
 }
 
 func getBuildID(ctx context.Context, file string) (string, error) {
@@ -208,7 +203,7 @@ func getBuildID(ctx context.Context, file string) (string, error) {
 	cmd.Stdout = &output
 
 	if err := cmd.Run(); err != nil {
-		log.Printf("Unexpected error running \"go tool buildid %s\": %v\n%v", err, file, output.String())
+		log.Printf("Unexpected error running \"go tool buildid %s\": %v\n%v", file, err, output.String())
 		return "", fmt.Errorf("go tool buildid %s: %w", file, err)
 	}
 	return strings.TrimSpace(output.String()), nil
